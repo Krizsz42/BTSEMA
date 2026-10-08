@@ -26,25 +26,64 @@ def norm(s: str) -> str:
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 
-def extraer_secciones(html: str) -> dict:
-    """{nombre_norm: {nombre, disponible, pocas}} uniendo duplicados (disponible si alguna dice true)."""
-    out: dict = {}
-    for m in re.finditer(
-        r'\{"id":\d+,"name":"((?:[^"\\]|\\.)*)","uuid":"[^"]*","available":(true|false),"lowAvailability":(true|false)\}',
-        html,
-    ):
-        try:
-            nombre = json.loads('"' + m.group(1) + '"')
-        except Exception:
-            nombre = m.group(1)
-        key = norm(nombre)
-        disp = m.group(2) == "true"
-        low = m.group(3) == "true"
-        if key in out:
-            out[key]["disponible"] = out[key]["disponible"] or disp
-            out[key]["pocas"] = out[key]["pocas"] or low
+def _bracket(s: str, i: int):
+    depth, j, instr, esc = 0, i, False, False
+    while j < len(s):
+        c = s[j]
+        if instr:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                instr = False
         else:
-            out[key] = {"nombre": nombre, "disponible": disp, "pocas": low}
+            if c == '"':
+                instr = True
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    return s[i:j + 1]
+        j += 1
+    return None
+
+
+def extraer_secciones(html: str) -> dict:
+    """Stock REAL por seccion: suma availability de las tarifas con available=true.
+    {nombre_norm: {nombre, stock, desde}} — el flag sectionAvailability no se usa (miente)."""
+    out: dict = {}
+    for m in re.finditer(r'"rates":\[', html):
+        rates_txt = _bracket(html, m.end() - 1)
+        if rates_txt is None:
+            continue
+        tail = m.end() - 1 + len(rates_txt)
+        if html[tail:tail + 13] != '],"sections":[':
+            continue
+        secs_txt = _bracket(html, tail + 13)
+        if secs_txt is None:
+            continue
+        nombres = []
+        for nm in re.finditer(r'"name":"((?:[^"\\]|\\.)*)"', secs_txt):
+            try:
+                nombres.append(json.loads('"' + nm.group(1) + '"'))
+            except Exception:
+                nombres.append(nm.group(1))
+        for r in re.finditer(r'"price":(\d+)[^}]*?"availability":(\d+)[^}]*?"available":(true|false)', rates_txt):
+            if r.group(3) != "true":
+                continue
+            cant = int(r.group(2))
+            if cant <= 0:
+                continue
+            precio = int(r.group(1))
+            for nombre in nombres:
+                key = norm(nombre)
+                e = out.get(key, {"nombre": nombre, "stock": 0, "desde": None})
+                e["stock"] += cant
+                if e["desde"] is None or precio < e["desde"]:
+                    e["desde"] = precio
+                out[key] = e
     return out
 
 
@@ -66,9 +105,9 @@ async def fetch_event(url: str) -> tuple[dict | None, str]:
             await asyncio.sleep(1)
             continue
         secs = extraer_secciones(text)
-        if secs:
+        if secs or '"rates":' in text:
             return secs, f"HTTP 200 ({len(text)//1000}kb)"
-        last = "HTTP 200 sin secciones"
+        last = "HTTP 200 sin datos"
     return None, last
 
 
@@ -143,28 +182,31 @@ async def ronda():
         primera = not prev
         for objetivo in ev["secciones"]:
             key = norm(objetivo)
-            cur = secs.get(key)
-            if cur is None:
-                print(f"? seccion no encontrada: {objetivo}", flush=True)
-                continue
-            ant = prev.get(key, {})
-            est = "DISPONIBLE" if cur["disponible"] else "agotada"
-            print(f"[{'!' if cur['disponible'] else 'x'}] {cur['nombre']}: {est}" +
-                  (" (pocas!)" if cur["pocas"] else ""), flush=True)
-            if primera:
-                await enviar_a_todos(
-                    f"Tickets - {ev['nombre']}\n{cur['nombre']}: {est}\n{ev['url']}")
+            cur = secs.get(key, {"nombre": objetivo, "stock": 0, "desde": None})
+            ant_stock = prev.get(key, {}).get("stock")
+            nombre = cur.get("nombre", objetivo)
+            if cur["stock"] > 0:
+                print(f"[!] {nombre}: {cur['stock']} entradas desde ${cur['desde']:,}".replace(",", "."), flush=True)
             else:
-                if cur["disponible"] and not ant.get("disponible"):
+                print(f"[x] {nombre}: sin stock", flush=True)
+            if primera:
+                if cur["stock"] > 0:
                     await enviar_a_todos(
-                        f"SE LIBERO - {ev['nombre']}\n{cur['nombre']} disponible!\n{ev['url']}")
-                elif not cur["disponible"] and ant.get("disponible"):
+                        f"Tickets - {ev['nombre']}\n{nombre}: {cur['stock']} entradas desde ${cur['desde']:,}\n{ev['url']}".replace(",", "."))
+                else:
                     await enviar_a_todos(
-                        f"AGOTADA - {ev['nombre']}\n{cur['nombre']} se agoto.\n{ev['url']}")
-                elif cur["pocas"] and not ant.get("pocas"):
+                        f"Tickets - {ev['nombre']}\n{nombre}: sin stock ahora, avisando cambios.\n{ev['url']}")
+            elif ant_stock is not None and cur["stock"] != ant_stock:
+                if cur["stock"] > 0 and ant_stock == 0:
                     await enviar_a_todos(
-                        f"POCAS - {ev['nombre']}\n{cur['nombre']}: quedan pocas!\n{ev['url']}")
-            prev[key] = cur
+                        f"SE LIBERO - {ev['nombre']}\n{nombre}: {cur['stock']} entradas desde ${cur['desde']:,}\n{ev['url']}".replace(",", "."))
+                elif cur["stock"] == 0:
+                    await enviar_a_todos(
+                        f"AGOTADA - {ev['nombre']}\n{nombre} se agoto.\n{ev['url']}")
+                elif cur["stock"] <= 10:
+                    await enviar_a_todos(
+                        f"POCAS - {ev['nombre']}\n{nombre}: quedan {cur['stock']}!\n{ev['url']}")
+            prev[key] = {"nombre": nombre, "stock": cur["stock"], "desde": cur.get("desde")}
         estado[ev["url"]] = prev
         await asyncio.sleep(random.uniform(1, 2))
     guardar_estado(estado)
@@ -196,8 +238,10 @@ async def telegram_poll_loop():
                     for ev in config.EVENTOS:
                         for s in ev["secciones"]:
                             cur = estado.get(ev["url"], {}).get(norm(s))
-                            if cur:
-                                lineas.append(f"- {cur['nombre']}: {'DISPONIBLE' if cur['disponible'] else 'agotada'}")
+                            if cur and cur.get("stock", 0) > 0:
+                                lineas.append(f"- {cur['nombre']}: {cur['stock']} entradas desde ${cur['desde']:,}".replace(",", "."))
+                            elif cur:
+                                lineas.append(f"- {cur['nombre']}: sin stock")
                             else:
                                 lineas.append(f"- {s}: sin lectura aun")
                     await enviar_telegram("\n".join(lineas), chat_id=chat)
