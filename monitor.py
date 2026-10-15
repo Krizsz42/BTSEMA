@@ -24,7 +24,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE = Path(__file__).parent / "state_ticket.json"
 SUBS_FILE = Path(__file__).parent / "subscribers.json"
-PROFILE_DIR = Path(__file__).parent / "tm_profile"
+PROFILE_DIR = Path(__file__).parent / "brave_profile"
+BRAVE_EXE = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 
 
 def norm(s: str) -> str:
@@ -61,10 +62,13 @@ async def fetch_navegador(url: str) -> tuple[dict | None, str]:
     """Retorna (sectores, detalle). Sectores {} = pagina cargo pero nada comprable."""
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
+        launch = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
+        if Path(BRAVE_EXE).exists():
+            launch["executable_path"] = BRAVE_EXE
+        else:
+            launch["channel"] = "chrome"
         browser = await p.chromium.launch_persistent_context(
-            str(PROFILE_DIR), channel="chrome", headless=True,
-            locale="es-CL", viewport={"width": 1366, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"])
+            str(PROFILE_DIR), locale="es-CL", viewport={"width": 1366, "height": 900}, **launch)
         page = await browser.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
