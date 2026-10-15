@@ -1,4 +1,7 @@
 .env
 __pycache__/
-state.json
+state*.json
+subscribers.json
+tm_profile/
 *.html
+*.png
