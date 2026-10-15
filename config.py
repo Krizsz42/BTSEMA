@@ -1,8 +1,8 @@
 # Bot Tickets Chile (Ticketmaster)
 # Vigila secciones de un evento y avisa a Telegram cuando se liberan.
 
-# --- Cada cuántos segundos revisar (lento: Ticketmaster desafia si se golpea seguido) ---
-INTERVALO_SEGUNDOS = 300
+# --- Lento a proposito: Ticketmaster pausa la IP si se golpea seguido ---
+INTERVALO_SEGUNDOS = 600
 
 # --- Eventos y secciones a vigilar (nombres sin tilde sirven igual) ---
 EVENTOS = [
