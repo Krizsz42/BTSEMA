@@ -1,4 +1,9 @@
-"""Bot Tickets: vigila secciones Ticketmaster y avisa por Telegram."""
+"""Bot Tickets: vigila sectores Ticketmaster con navegador real y avisa por Telegram.
+
+Ticketmaster bloquea con desafio de identidad si se le golpea muy seguido:
+- intervalo lento (5 min), perfil persistente, backoff si sale el desafio.
+- pensado para correr en PC (el headless de datacenter lo bloquean al tiro).
+"""
 import asyncio
 import json
 import os
@@ -19,6 +24,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE = Path(__file__).parent / "state_ticket.json"
 SUBS_FILE = Path(__file__).parent / "subscribers.json"
+PROFILE_DIR = Path(__file__).parent / "tm_profile"
 
 
 def norm(s: str) -> str:
@@ -26,89 +32,59 @@ def norm(s: str) -> str:
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 
-def _bracket(s: str, i: int):
-    depth, j, instr, esc = 0, i, False, False
-    while j < len(s):
-        c = s[j]
-        if instr:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                instr = False
-        else:
-            if c == '"':
-                instr = True
-            elif c == "[":
-                depth += 1
-            elif c == "]":
-                depth -= 1
-                if depth == 0:
-                    return s[i:j + 1]
-        j += 1
-    return None
-
-
-def extraer_secciones(html: str) -> dict:
-    """Stock REAL por seccion: suma availability de las tarifas con available=true.
-    {nombre_norm: {nombre, stock, desde}} — el flag sectionAvailability no se usa (miente)."""
+def leer_lista(fuente: str) -> dict:
+    """Sectores comprables: {norm: {nombre, precio}} desde el TEXTO visible
+    ('Cancha Pacifico Desde $ 250.000 + $ 43.750 Sin numerar'). Si recibe HTML, pela tags."""
+    if "<" in fuente and ">" in fuente:
+        fuente = re.sub(r"<script.*?</script>", " ", fuente, flags=re.S)
+        fuente = re.sub(r"<style.*?</style>", " ", fuente, flags=re.S)
+        fuente = re.sub(r"<[^>]+>", " ", fuente)
+    texto = re.sub(r"\s+", " ", fuente)
     out: dict = {}
-    for m in re.finditer(r'"rates":\[', html):
-        rates_txt = _bracket(html, m.end() - 1)
-        if rates_txt is None:
+    for m in re.finditer(
+        r'([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ 0-9\-/]{2,60}?)\s*Desde\s*\$\s*(\d{1,3}(?:\.\d{3})+)',
+        texto,
+    ):
+        nombre = m.group(1).strip()
+        if len(nombre) < 3 or "sector" in norm(nombre):
             continue
-        tail = m.end() - 1 + len(rates_txt)
-        if html[tail:tail + 13] != '],"sections":[':
+        precio = int(m.group(2).replace(".", ""))
+        if not 10000 <= precio <= 5000000:
             continue
-        secs_txt = _bracket(html, tail + 13)
-        if secs_txt is None:
-            continue
-        nombres = []
-        for nm in re.finditer(r'"name":"((?:[^"\\]|\\.)*)"', secs_txt):
-            try:
-                nombres.append(json.loads('"' + nm.group(1) + '"'))
-            except Exception:
-                nombres.append(nm.group(1))
-        for r in re.finditer(r'"price":(\d+)[^}]*?"availability":(\d+)[^}]*?"available":(true|false)', rates_txt):
-            if r.group(3) != "true":
-                continue
-            cant = int(r.group(2))
-            if cant <= 0:
-                continue
-            precio = int(r.group(1))
-            for nombre in nombres:
-                key = norm(nombre)
-                e = out.get(key, {"nombre": nombre, "stock": 0, "desde": None})
-                e["stock"] += cant
-                if e["desde"] is None or precio < e["desde"]:
-                    e["desde"] = precio
-                out[key] = e
+        key = norm(nombre)
+        if key not in out or precio < out[key]["precio"]:
+            out[key] = {"nombre": nombre, "precio": precio}
     return out
 
 
-async def fetch_event(url: str) -> tuple[dict | None, str]:
-    def _get(imp: str):
-        from curl_cffi import requests as creq
-        r = creq.get(url, impersonate=imp, timeout=25,  # type: ignore
-                     headers={"Accept-Language": "es-CL,es;q=0.9"})
-        return r.status_code, r.text
-    last = "?"
-    for imp in ("chrome", "safari15_5", "chrome120"):
+async def fetch_navegador(url: str) -> tuple[dict | None, str]:
+    """Retorna (sectores, detalle). Sectores {} = pagina cargo pero nada comprable."""
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch_persistent_context(
+            str(PROFILE_DIR), channel="chrome", headless=True,
+            locale="es-CL", viewport={"width": 1366, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"])
+        page = await browser.new_page()
         try:
-            status, text = await asyncio.to_thread(_get, imp)
-        except Exception:
-            last = f"err-{imp}"
-            continue
-        last = f"HTTP {status}"
-        if status != 200:
-            await asyncio.sleep(1)
-            continue
-        secs = extraer_secciones(text)
-        if secs or '"rates":' in text:
-            return secs, f"HTTP 200 ({len(text)//1000}kb)"
-        last = "HTTP 200 sin datos"
-    return None, last
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.get_by_text("Seleccionar sector").wait_for(timeout=40000)
+            except Exception:
+                title = await page.title()
+                if "Identity Verified" in title or "verify" in title.lower():
+                    return None, "desafio-identidad"
+                # reintento una vez: si la pagina cargo pero no hay lista, es lista vacia real
+                await page.wait_for_timeout(15000)
+                try:
+                    await page.get_by_text("Seleccionar sector").wait_for(timeout=20000)
+                except Exception:
+                    return {}, "lista-vacia"
+            await page.wait_for_timeout(3000)
+            texto = await page.evaluate("document.body ? document.body.innerText : ''")
+            return leer_lista(texto or ""), "navegador (texto visible)"
+        finally:
+            await browser.close()
 
 
 def cargar_estado() -> dict:
@@ -131,8 +107,7 @@ def cargar_subs() -> set:
     if SUBS_FILE.exists():
         try:
             data = json.loads(SUBS_FILE.read_text(encoding="utf-8"))
-            items = data if isinstance(data, list) else list(data.keys())
-            for x in items:
+            for x in (data if isinstance(data, list) else list(data.keys())):
                 subs.add(str(x))
         except Exception:
             pass
@@ -173,42 +148,43 @@ async def ronda():
     estado = cargar_estado()
     print(f"\n=== Ronda tickets {datetime.now().strftime('%H:%M:%S')} ===", flush=True)
     for ev in config.EVENTOS:
-        secs, detalle = await fetch_event(ev["url"])
-        if secs is None:
-            print(f"? {ev['nombre']}: sin lectura ({detalle})", flush=True)
-            await asyncio.sleep(2)
+        try:
+            lista, detalle = await fetch_navegador(ev["url"])
+        except Exception as e:
+            print(f"? {ev['nombre']}: error navegador {str(e)[:120]}", flush=True)
+            await asyncio.sleep(5)
             continue
+        if lista is None:  # desafio o sin lista: backoff, no tocar estado
+            print(f"! {ev['nombre']}: {detalle} -> espero mas", flush=True)
+            estado["_bloqueo"] = estado.get("_bloqueo", 0) + 1
+            guardar_estado(estado)
+            return
+        estado["_bloqueo"] = 0
+        print(f"  comprables: {len(lista)} ({detalle})", flush=True)
         prev = estado.get(ev["url"], {})
         primera = not prev
+        vistos = set()
         for objetivo in ev["secciones"]:
             key = norm(objetivo)
-            cur = secs.get(key, {"nombre": objetivo, "stock": 0, "desde": None})
-            ant_stock = prev.get(key, {}).get("stock")
-            nombre = cur.get("nombre", objetivo)
-            if cur["stock"] > 0:
-                print(f"[!] {nombre}: {cur['stock']} entradas desde ${cur['desde']:,}".replace(",", "."), flush=True)
-            else:
-                print(f"[x] {nombre}: sin stock", flush=True)
-            if primera:
-                if cur["stock"] > 0:
-                    await enviar_a_todos(
-                        f"Tickets - {ev['nombre']}\n{nombre}: {cur['stock']} entradas desde ${cur['desde']:,}\n{ev['url']}".replace(",", "."))
-                else:
-                    await enviar_a_todos(
-                        f"Tickets - {ev['nombre']}\n{nombre}: sin stock ahora, avisando cambios.\n{ev['url']}")
-            elif ant_stock is not None and cur["stock"] != ant_stock:
-                if cur["stock"] > 0 and ant_stock == 0:
-                    await enviar_a_todos(
-                        f"SE LIBERO - {ev['nombre']}\n{nombre}: {cur['stock']} entradas desde ${cur['desde']:,}\n{ev['url']}".replace(",", "."))
-                elif cur["stock"] == 0:
-                    await enviar_a_todos(
-                        f"AGOTADA - {ev['nombre']}\n{nombre} se agoto.\n{ev['url']}")
-                elif cur["stock"] <= 10:
-                    await enviar_a_todos(
-                        f"POCAS - {ev['nombre']}\n{nombre}: quedan {cur['stock']}!\n{ev['url']}")
-            prev[key] = {"nombre": nombre, "stock": cur["stock"], "desde": cur.get("desde")}
+            cur = lista.get(key)
+            vistos.add(key)
+            ant = prev.get(key)
+            if cur is None:
+                print(f"[x] {objetivo}: no comprable ahora", flush=True)
+                if not primera and ant and ant.get("comprable"):
+                    await enviar_a_todos(f"AGOTADA - {ev['nombre']}\n{objetivo} salio de la lista.\n{ev['url']}")
+                prev[key] = {"nombre": objetivo, "comprable": False, "precio": None}
+                continue
+            print(f"[!] {cur['nombre']}: COMPRABLE desde ${cur['precio']:,}".replace(",", "."), flush=True)
+            if primera or not (ant and ant.get("comprable")):
+                await enviar_a_todos(
+                    f"{'Tickets' if primera else 'SE LIBERO'} - {ev['nombre']}\n{cur['nombre']}: comprable desde ${cur['precio']:,}\n{ev['url']}".replace(",", "."))
+            elif ant.get("precio") != cur["precio"]:
+                await enviar_a_todos(
+                    f"CAMBIO PRECIO - {ev['nombre']}\n{cur['nombre']}: ${cur['precio']:,}\n{ev['url']}".replace(",", "."))
+            prev[key] = {"nombre": cur["nombre"], "comprable": True, "precio": cur["precio"]}
         estado[ev["url"]] = prev
-        await asyncio.sleep(random.uniform(1, 2))
+        await asyncio.sleep(random.uniform(3, 6))
     guardar_estado(estado)
 
 
@@ -238,10 +214,10 @@ async def telegram_poll_loop():
                     for ev in config.EVENTOS:
                         for s in ev["secciones"]:
                             cur = estado.get(ev["url"], {}).get(norm(s))
-                            if cur and cur.get("stock", 0) > 0:
-                                lineas.append(f"- {cur['nombre']}: {cur['stock']} entradas desde ${cur['desde']:,}".replace(",", "."))
+                            if cur and cur.get("comprable"):
+                                lineas.append(f"- {cur['nombre']}: COMPRABLE ${cur['precio']:,}".replace(",", "."))
                             elif cur:
-                                lineas.append(f"- {cur['nombre']}: sin stock")
+                                lineas.append(f"- {s}: no comprable ahora")
                             else:
                                 lineas.append(f"- {s}: sin lectura aun")
                     await enviar_telegram("\n".join(lineas), chat_id=chat)
@@ -252,7 +228,7 @@ async def telegram_poll_loop():
 
 
 async def main():
-    print("Bot Tickets iniciado", flush=True)
+    print("Bot Tickets iniciado (modo navegador)", flush=True)
     asyncio.create_task(telegram_poll_loop())
     while True:
         try:
@@ -261,7 +237,13 @@ async def main():
             sys.exit(0)
         except Exception as e:
             print(f"Error en ronda: {e}", flush=True)
-        espera = config.INTERVALO_SEGUNDOS * random.uniform(0.8, 1.2)
+        bloq = 1
+        try:
+            bloq = cargar_estado().get("_bloqueo", 0)
+        except Exception:
+            pass
+        base = config.INTERVALO_SEGUNDOS * (6 if bloq else 1)  # backoff x6 si hay desafio
+        espera = base * random.uniform(0.8, 1.2)
         print(f"proxima revision en {int(espera)}s...", flush=True)
         await asyncio.sleep(espera)
 
